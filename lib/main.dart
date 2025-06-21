@@ -427,7 +427,16 @@ class StorageScannerState extends State<StorageScanner> {
 
     explorerKeys[node.fullPath ?? node.name] = nodeKey;
 
-    String displayLabel = _basename(node.fullPath ?? node.name);
+    String displayLabel;
+    if (node.type == 'Symlink') {
+      displayLabel = '(Symlink) ${_basename(node.fullPath ?? node.name)}'
+          ' -> ${node.target ?? "Unknown"}';
+    } else if (node.type == 'Duplicate') {
+      displayLabel = '(Duplicate) ${_basename(node.fullPath ?? node.name)}'
+          ' -> ${node.target ?? "Unknown"}';
+    } else {
+      displayLabel = _basename(node.fullPath ?? node.name);
+    }
 
     // --- TRUE SIZE AND PERCENTAGE LOGIC ---
     String? sizeDisplay;
