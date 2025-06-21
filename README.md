@@ -19,3 +19,13 @@
 
 * Symlinks are treated as files to prevent loops.
 * Duplicate directories (by inode) are automatically excluded.
+
+---
+
+## Changelog
+
+### v1.1.0
+
+* 🎨 Added true random colorization for better visual distinction.
+* 📂 Added display of percentage and storage used in the explorer view.
+* 📁 Added **Open in File Manager** option on long press in the explorer menu.

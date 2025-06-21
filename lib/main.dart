@@ -1,4 +1,5 @@
 import 'dart:collection';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:syncfusion_flutter_treemap/treemap.dart';
@@ -27,14 +28,15 @@ class StorageScanner extends StatefulWidget {
   const StorageScanner({super.key});
 
   @override
-  _StorageScannerState createState() => _StorageScannerState();
+  StorageScannerState createState() => StorageScannerState();
 }
 
-class _StorageScannerState extends State<StorageScanner> {
+class StorageScannerState extends State<StorageScanner> {
   final TextEditingController _pathController = TextEditingController(text: '/');
   final Map<String, List<String>> inodeDict = {};
   final Map<String, String> inodeTypeDict = {};
   final platform = const MethodChannel('com.example.adirstat/shell');
+  final MethodChannel fileManagerChannel = const MethodChannel('com.example.adirstat/filemanager');
 
   TreeNode? rootNode;
   TreeNode? selectedNode;
@@ -42,6 +44,7 @@ class _StorageScannerState extends State<StorageScanner> {
 
   Set<String> expandedPaths = {};
   int explorerRefresh = 0;
+
   String bytesToHuman(int bytes) {
     if (bytes < 1024) return '$bytes B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
@@ -49,6 +52,7 @@ class _StorageScannerState extends State<StorageScanner> {
     if (bytes < 1024 * 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
     return '${(bytes / (1024 * 1024 * 1024 * 1024)).toStringAsFixed(2)} TB';
   }
+
   final List<Color> colorPalette = [
     Colors.blue,
     Colors.green,
@@ -71,12 +75,10 @@ class _StorageScannerState extends State<StorageScanner> {
   final Map<String, GlobalKey> explorerKeys = {};
 
   String scanningDirRelativePath = '';
-
-  // Fullscreen mode toggle
   bool isFullscreen = false;
-
-  // Focus for catching keyboard events (esc/back)
   final FocusNode _focusNode = FocusNode();
+
+  int rootTrueSize = 0;
 
   Future<String> runShellCommand(String command) async {
     try {
@@ -86,7 +88,13 @@ class _StorageScannerState extends State<StorageScanner> {
       return 'Error: $e';
     }
   }
-
+  Future<void> openInFileManager(String path) async {
+    try {
+      await fileManagerChannel.invokeMethod('openInFileManager', {'path': path});
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+    }
+  }
   Future<void> startScan() async {
     final startPath = _pathController.text.trim();
     if (startPath.isEmpty) return;
@@ -101,9 +109,16 @@ class _StorageScannerState extends State<StorageScanner> {
       parentFolderColorMap.clear();
       scanRoot = startPath;
       scanningDirRelativePath = '';
+      rootTrueSize = 0;
     });
 
     rootNode = await bfsBuildTree(startPath);
+
+    // Compute true size for each node
+    if (rootNode != null) {
+      computeTrueSize(rootNode!, inodeDict);
+      rootTrueSize = rootNode!.trueSize;
+    }
 
     setState(() {
       isScanning = false;
@@ -115,7 +130,6 @@ class _StorageScannerState extends State<StorageScanner> {
     Queue<Map<String, dynamic>> bfsQueue = Queue();
     Map<String, TreeNode> nodeByPath = {};
 
-    // Root node
     TreeNode root = TreeNode(
       name: _basename(startPath),
       size: 0,
@@ -141,7 +155,6 @@ class _StorageScannerState extends State<StorageScanner> {
       Map<String, String> duSizes = parseDuOutput(duOutput);
       List<Map<String, dynamic>> lsEntries = parseLsOutput(lsOutput, currentPath);
 
-      // Build children, sorted by duSizes (descending)
       List<TreeNode> children = [];
       for (var entry in lsEntries) {
         String inode = entry['inode'];
@@ -150,7 +163,6 @@ class _StorageScannerState extends State<StorageScanner> {
         String? target = entry['target'];
         String fullPath = currentPath.endsWith('/') ? '$currentPath$name' : '$currentPath/$name';
 
-        // Store type for inode (for explorer rendering)
         inodeTypeDict[inode] = type;
 
         if (inodeDict.containsKey(inode)) {
@@ -215,13 +227,33 @@ class _StorageScannerState extends State<StorageScanner> {
         }
       }
 
-      // Sort current children by size descending (from du)
       children.sort((a, b) => b.size.compareTo(a.size));
       parentNode.children = children;
 
       setState(() {});
     }
     return root;
+  }
+
+  // --- Compute true size with postorder ---
+  void computeTrueSize(TreeNode node, Map<String, List<String>> inodeDict) {
+    // Only count the first instance of this inode (inodeDict[inode][0])
+    if (node.inode != null &&
+        inodeDict[node.inode] != null &&
+        inodeDict[node.inode]![0] != node.fullPath) {
+      node.trueSize = 0;
+      return;
+    }
+    if (node.type != 'Directory') {
+      node.trueSize = node.size;
+      return;
+    }
+    int sum = 0;
+    for (final child in node.children) {
+      computeTrueSize(child, inodeDict);
+      sum += child.trueSize;
+    }
+    node.trueSize = sum;
   }
 
   List<Map<String, dynamic>> parseLsOutput(String output, String basePath) {
@@ -308,8 +340,8 @@ class _StorageScannerState extends State<StorageScanner> {
     }
   }
 
-  List<_TreemapEntry> flattenTree(TreeNode root) {
-    List<_TreemapEntry> allNodes = [];
+  List<TreemapEntry> flattenTree(TreeNode root) {
+    List<TreemapEntry> allNodes = [];
     void traverse(TreeNode node, String? parentFolderPath) {
       if (node.type != 'Directory' && node.type != 'Unknown') {
         if (node.size == 0 || node.size.isNaN || node.size < 0) {
@@ -317,20 +349,29 @@ class _StorageScannerState extends State<StorageScanner> {
         } else {
           String immediateParent = parentFolderPath ?? '';
           if (!parentFolderColorMap.containsKey(immediateParent)) {
-            int idx = parentFolderColorMap.length % colorPalette.length;
-            parentFolderColorMap[immediateParent] = colorPalette[idx];
+            parentFolderColorMap[immediateParent] = generateColorFromPath(immediateParent);
           }
-          int colorIdx = colorPalette.indexOf(parentFolderColorMap[immediateParent]!);
-          allNodes.add(_TreemapEntry(node: node, colorIdx: colorIdx));
+          Color color = parentFolderColorMap[immediateParent]!;
+          allNodes.add(TreemapEntry(node: node, color: color));
         }
       }
-      // Traverse children in order (they have already been sorted by size)
       for (var child in node.children) {
         traverse(child, node.fullPath);
       }
     }
     traverse(root, null);
     return allNodes;
+  }
+
+  Color generateColorFromPath(String path) {
+    final hash = path.hashCode;
+    final rnd = Random(hash);
+    return Color.fromARGB(
+      255,
+      100 + rnd.nextInt(156),
+      100 + rnd.nextInt(156),
+      100 + rnd.nextInt(156),
+    );
   }
 
   List<TreeNode> pathToNodeNodes(TreeNode root, TreeNode target) {
@@ -352,7 +393,7 @@ class _StorageScannerState extends State<StorageScanner> {
     return path.reversed.toList();
   }
 
-  void onTreemapTap(_TreemapEntry entry) {
+  void onTreemapTap(TreemapEntry entry) {
     setState(() {
       selectedNode = entry.node;
       expandedPaths.clear();
@@ -382,65 +423,91 @@ class _StorageScannerState extends State<StorageScanner> {
 
   Widget buildExplorer(TreeNode? node) {
     if (node == null) return const SizedBox();
-    final nodeKey = explorerKeys[node.fullPath ?? node.name] ?? GlobalKey();
+    final nodeKey = GlobalKey();
+
     explorerKeys[node.fullPath ?? node.name] = nodeKey;
 
     String displayLabel = _basename(node.fullPath ?? node.name);
 
-    // Show symlink as: (Symlink) file -> /target/path
-    if (node.type == 'Symlink') {
-      displayLabel = '(Symlink) $displayLabel -> ${node.target ?? "Unknown"}';
-    }
-    // Show duplicate as: (Duplicate) file -> /first/path/with/same/inode
-    else if (node.type == 'Duplicate') {
-      displayLabel = '(Duplicate) $displayLabel -> ${node.target ?? "Unknown"}';
+    // --- TRUE SIZE AND PERCENTAGE LOGIC ---
+    String? sizeDisplay;
+    String? percentDisplay;
+    bool showSize = false;
+
+    if (node.type != 'Symlink' && node.type != 'Duplicate' && node.type != 'Unknown') {
+      showSize = true;
     }
 
-    // Styling: folders bold, symlinks/duplicates italic
-    TextStyle style = TextStyle(
-      fontSize: 14,
-      fontWeight: node.type == 'Directory' ? FontWeight.bold : FontWeight.normal,
-      fontStyle: (node.type == 'Symlink' || node.type == 'Duplicate')
-          ? FontStyle.italic
-          : FontStyle.normal,
-      color: (node.type == 'Symlink' || node.type == 'Duplicate')
-          ? Colors.teal
-          : null,
-    );
+    if (showSize && rootTrueSize > 0 && node.trueSize > 0) {
+      sizeDisplay = bytesToHuman(node.trueSize);
+      percentDisplay = "${((node.trueSize / rootTrueSize) * 100).toStringAsFixed(1)}%";
+    }
 
-    if (node.type != 'Directory' && node.type != 'Unknown') {
-      return ListTile(
+    Widget sizeWidget = (showSize && sizeDisplay != null && percentDisplay != null)
+        ? Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(sizeDisplay, style: const TextStyle(fontSize: 13, color: Colors.grey)),
+        const SizedBox(width: 8),
+        Text(percentDisplay, style: const TextStyle(fontSize: 13, color: Colors.grey)),
+      ],
+    )
+        : const SizedBox();
+
+    return GestureDetector(
+      onLongPress: () {
+        if (node.fullPath != null) {
+          String parentPath = node.fullPath!;
+          if (node.type != 'Directory') {
+            final segments = parentPath.split('/');
+            parentPath = segments.take(segments.length - 1).join('/');
+            if (parentPath.isEmpty) parentPath = '/';
+          }
+          openInFileManager(parentPath);
+        }
+      },
+      child: node.type != 'Directory' && node.type != 'Unknown'
+          ? ListTile(
         key: nodeKey,
         dense: true,
-        title: Text(displayLabel, style: style),
+        title: Row(
+          children: [
+            Expanded(child: Text(displayLabel)),
+            sizeWidget,
+          ],
+        ),
         selected: node == selectedNode,
         onTap: () {
           setState(() {
             selectedNode = node;
           });
         },
-      );
-    }
-    bool initiallyExpanded = expandedPaths.contains(node.fullPath);
-    return ExpansionTile(
-      key: Key('${node.fullPath}-$initiallyExpanded'),
-      title: Text(
-        node.fullPath == scanRoot
-            ? _basename(scanRoot)
-            : _basename(node.fullPath ?? node.name),
-        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+      )
+          : ExpansionTile(
+        key: Key('${node.fullPath}-${expandedPaths.contains(node.fullPath)}'),
+        title: Row(
+          children: [
+            Expanded(
+              child: Text(
+                displayLabel,
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+            sizeWidget,
+          ],
+        ),
+        initiallyExpanded: expandedPaths.contains(node.fullPath),
+        children: node.children.map((child) => buildExplorer(child)).toList(),
+        onExpansionChanged: (expanded) {
+          setState(() {
+            if (expanded) {
+              expandedPaths.add(node.fullPath ?? node.name);
+            } else {
+              expandedPaths.remove(node.fullPath ?? node.name);
+            }
+          });
+        },
       ),
-      initiallyExpanded: initiallyExpanded,
-      children: node.children.map((child) => buildExplorer(child)).toList(),
-      onExpansionChanged: (expanded) {
-        setState(() {
-          if (expanded) {
-            expandedPaths.add(node.fullPath ?? node.name);
-          } else {
-            expandedPaths.remove(node.fullPath ?? node.name);
-          }
-        });
-      },
     );
   }
 
@@ -461,14 +528,12 @@ class _StorageScannerState extends State<StorageScanner> {
     return path;
   }
 
-  // --- Fullscreen logic: catch escape key and Android back ---
   @override
   void initState() {
     super.initState();
     _focusNode.requestFocus();
   }
 
-  // Handle Android back (pop out of fullscreen)
   Future<bool> _onWillPop() async {
     if (isFullscreen) {
       setState(() {
@@ -496,8 +561,7 @@ class _StorageScannerState extends State<StorageScanner> {
           appBar: isFullscreen
               ? null
               : AppBar(
-            title: const Text("ADirStat",
-                style: TextStyle(fontSize: 20)),
+            title: const Text("ADirStat", style: TextStyle(fontSize: 20)),
             actions: [
               IconButton(
                 icon: Icon(Icons.fullscreen),
@@ -516,7 +580,6 @@ class _StorageScannerState extends State<StorageScanner> {
                 ? _buildMainView()
                 : Column(
               children: [
-                // Path input and Start Scan on one line
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
@@ -571,7 +634,6 @@ class _StorageScannerState extends State<StorageScanner> {
     }
     return Row(
       children: [
-        // Explorer on left
         Container(
           width: 260,
           decoration: BoxDecoration(
@@ -584,11 +646,10 @@ class _StorageScannerState extends State<StorageScanner> {
           ),
         ),
         const SizedBox(width: 8),
-        // Treemap on right
         Expanded(
           child: Builder(
             builder: (context) {
-              List<_TreemapEntry> allNodes = [];
+              List<TreemapEntry> allNodes = [];
               allNodes = flattenTree(rootNode!);
               if (allNodes.isEmpty) {
                 return const Center(child: Text('No files to display.'));
@@ -600,12 +661,10 @@ class _StorageScannerState extends State<StorageScanner> {
                 levels: [
                   TreemapLevel(
                     groupMapper: (int index) =>
-                    allNodes[index].node.fullPath ??
-                        allNodes[index].node.name,
+                    allNodes[index].node.fullPath ?? allNodes[index].node.name,
                     colorValueMapper: (TreemapTile tile) {
                       final entry = allNodes[tile.indices[0]];
-                      return colorPalette[
-                      entry.colorIdx % colorPalette.length];
+                      return entry.color;
                     },
                     labelBuilder: (BuildContext context, TreemapTile tile) {
                       return const SizedBox.shrink();
@@ -637,10 +696,10 @@ class _StorageScannerState extends State<StorageScanner> {
   }
 }
 
-class _TreemapEntry {
+class TreemapEntry {
   final TreeNode node;
-  final int colorIdx;
-  _TreemapEntry({required this.node, required this.colorIdx});
+  final Color color;
+  TreemapEntry({required this.node, required this.color});
 }
 
 class TreeNode {
@@ -651,6 +710,7 @@ class TreeNode {
   String? fullPath;
   String? inode;
   List<TreeNode> children;
+  int trueSize;
 
   TreeNode({
     required this.name,
@@ -660,5 +720,6 @@ class TreeNode {
     this.fullPath,
     this.children = const [],
     this.inode,
+    this.trueSize = 0,
   });
 }
